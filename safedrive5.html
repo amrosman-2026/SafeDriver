@@ -1,0 +1,1939 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>SafeDrive — Risk vs. Gain Monitor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <!--
+        FONTS
+        ─────
+        Rajdhani   → headings, labels, buttons. Military/industrial feel.
+        Share Tech Mono → all numerical readouts. Monospaced ensures digits
+                          don't shift width as numbers change (no layout jitter).
+    -->
+    <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+    <style>
+        /* ================================================================
+           DESIGN TOKENS  (CSS custom properties)
+           ─────────────────────────────────────────────────────────────────
+           All colours, radii and font families in one place so they can be
+           changed globally without hunting through the stylesheet.
+        ================================================================ */
+        :root {
+            --bg:          #0a0c0f;   /* page background — near black          */
+            --panel:       #111418;   /* card / log panel background            */
+            --border:      rgba(255,255,255,0.07); /* subtle separator lines    */
+            --safe:        #00e5a0;   /* green  — at or below speed limit       */
+            --warning:     #ffc820;   /* amber  — moderately over limit         */
+            --danger:      #ff3b30;   /* red    — extreme risk zone             */
+            --neutral:     #4a90a4;   /* teal   — informational / neutral       */
+            --text:        #e8edf2;   /* primary text colour                    */
+            --muted:       rgba(232,237,242,0.45); /* secondary / label text    */
+            --radius:      16px;      /* card border radius                     */
+            --font-head:   'Rajdhani', sans-serif;
+            --font-mono:   'Share Tech Mono', monospace;
+        }
+
+        /* Reset — browser default margins/padding cause layout surprises */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: var(--font-head);
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100svh;          /* svh = "small viewport height" — avoids mobile chrome bar issues */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-x: hidden;
+        }
+
+        /*
+            SCANLINE TEXTURE
+            ────────────────
+            A repeating horizontal gradient creates a faint CRT / HUD overlay
+            effect without any image assets. pointer-events:none ensures it
+            never intercepts taps/clicks.
+        */
+        body::before {
+            content: '';
+            position: fixed; inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent, transparent 3px,
+                rgba(0,0,0,0.08) 3px, rgba(0,0,0,0.08) 4px
+            );
+            pointer-events: none;
+            z-index: 9;
+        }
+
+        /* ================================================================
+           SWIPE CONTAINER
+           ─────────────────────────────────────────────────────────────────
+           Both dashboard screens sit inside a horizontal strip.
+           CSS transform: translateX() slides between them without DOM
+           show/hide (which would reset scroll position and cause flicker).
+           overflow:hidden clips whichever screen is off-canvas.
+        ================================================================ */
+        #swipe-viewport {
+            width: 100%;
+            overflow: hidden;
+            position: relative;
+        }
+        #swipe-track {
+            display: flex;
+            width: 200%;           /* holds two full-width screens side by side */
+            transition: transform 0.38s cubic-bezier(0.4, 0, 0.2, 1);
+            will-change: transform; /* hints GPU compositing for smooth 60fps */
+        }
+        /*
+            Each screen occupies exactly 50% of the 200%-wide track,
+            which equals 100vw — one full viewport width.
+        */
+        #screen-normal,
+        #screen-danger {
+            width: 50%;            /* = 100vw in the context of 200% parent */
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        /* Swipe indicator dots (bottom navigation hint) */
+        .swipe-dots {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            padding: 12px 0 6px;
+        }
+        .swipe-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: var(--muted);
+            transition: background 0.3s, transform 0.3s;
+        }
+        .swipe-dot.active {
+            background: var(--danger);
+            transform: scale(1.4);
+        }
+
+        /* ================================================================
+           SPLASH / PERMISSION SCREEN
+           ─────────────────────────────────────────────────────────────────
+           Shown on load. User must tap "BEGIN TRIP" to:
+             1) Grant Geolocation permission (browser requirement)
+             2) Grant DeviceMotionEvent permission (iOS 13+ requirement)
+             3) Unlock SpeechSynthesis (browsers block autoplay audio)
+           Without a user gesture, all three APIs are either blocked or
+           return silent failures on mobile browsers.
+        ================================================================ */
+        #splash {
+            position: fixed; inset: 0; background: var(--bg);
+            z-index: 200;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            padding: 32px; text-align: center;
+            transition: opacity 0.6s ease, visibility 0.6s;
+        }
+        #splash.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+
+        .splash-icon {
+            width: 80px; height: 80px; border-radius: 50%;
+            border: 2px solid var(--safe);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 2.2rem; margin-bottom: 28px;
+            box-shadow: 0 0 30px rgba(0,229,160,0.25);
+            animation: pulse-ring 2s ease infinite;
+        }
+        /*
+            pulse-ring: Two-layer box-shadow animation.
+            Inner shadow stays visible (glow), outer shadow expands and
+            fades to simulate a ripple propagating outward.
+        */
+        @keyframes pulse-ring {
+            0%,100% { box-shadow: 0 0 0 0 rgba(0,229,160,0.4), 0 0 30px rgba(0,229,160,0.25); }
+            50%      { box-shadow: 0 0 0 14px rgba(0,229,160,0), 0 0 30px rgba(0,229,160,0.25); }
+        }
+
+        .splash-title    { font-size: 2.4rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+        .splash-subtitle { font-size: 1rem; color: var(--safe); letter-spacing: .3em; text-transform: uppercase; margin-bottom: 28px; }
+        .splash-desc     { max-width: 360px; font-size: .95rem; line-height: 1.7; color: var(--muted); margin-bottom: 40px; }
+        .feature-pills   { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 40px; }
+        .pill {
+            font-family: var(--font-mono); font-size: .7rem;
+            padding: 5px 12px; border-radius: 100px;
+            border: 1px solid var(--border); background: rgba(255,255,255,.04);
+            color: var(--muted); letter-spacing: .05em;
+        }
+        #btn-start {
+            font-family: var(--font-head); font-size: 1.1rem; font-weight: 700;
+            letter-spacing: .2em; text-transform: uppercase;
+            padding: 16px 48px; border: none; border-radius: 100px;
+            background: var(--safe); color: #000; cursor: pointer;
+            transition: transform .15s;
+            box-shadow: 0 0 30px rgba(0,229,160,0.25);
+        }
+        #btn-start:hover  { transform: scale(1.04); }
+        #btn-start:active { transform: scale(0.97); }
+
+        /* ================================================================
+           SHARED HEADER  (visible above both screens)
+        ================================================================ */
+        header {
+            width: 100%; max-width: 440px;
+            padding: 20px 24px 6px;
+            display: flex; align-items: center; justify-content: space-between;
+            flex-shrink: 0;
+        }
+        .logo { font-size: 1.1rem; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
+        .logo span { color: var(--safe); }
+
+        /*
+            GPS STATUS DOT
+            Green + blinking = GPS lock acquired and position stream active.
+            Muted grey = waiting for first GPS fix.
+        */
+        #status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--muted); transition: background .4s, box-shadow .4s;
+        }
+        #status-dot.active { background: var(--safe); box-shadow: 0 0 8px var(--safe); animation: blink 1.8s ease infinite; }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+        /* ================================================================
+           SPEED LIMIT BADGE
+           ─────────────────────────────────────────────────────────────────
+           Displayed in the header row so the driver always knows which
+           speed limit the app is currently enforcing. Sourced live from
+           OpenStreetMap's Overpass API based on current GPS coordinates.
+        ================================================================ */
+        #limit-badge {
+            display: flex; align-items: center; gap: 6px;
+            font-family: var(--font-mono); font-size: .75rem;
+            padding: 4px 10px; border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--panel);
+            color: var(--muted);
+            transition: color .4s, border-color .4s;
+        }
+        #limit-badge.enforcing {
+            color: var(--warning);
+            border-color: rgba(255,200,32,0.35);
+        }
+        #limit-badge.over-limit {
+            color: var(--danger);
+            border-color: rgba(255,59,48,0.35);
+            animation: badge-pulse 1s ease infinite;
+        }
+        @keyframes badge-pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+        #limit-num { font-size: 1rem; font-weight: 700; }
+
+        /* ================================================================
+           NORMAL DASHBOARD SCREEN
+        ================================================================ */
+
+        /*
+            SPEED RING (SVG arc)
+            ────────────────────
+            A circle's circumference for r=90 is 2π×90 ≈ 565px.
+            stroke-dasharray=565 means one full dash the same length as the
+            circle. stroke-dashoffset controls how much of that dash is
+            "pushed back" (hidden). Offset=565 → fully hidden (0 speed).
+            Offset=0 → fully shown (max speed).
+        */
+        .speed-section { display: flex; flex-direction: column; align-items: center; padding: 22px 0 6px; }
+        .ring-wrap { position: relative; width: 210px; height: 210px; }
+        #ring-svg { transform: rotate(-90deg); } /* rotate so arc starts at 12 o'clock */
+        #ring-track { stroke: rgba(255,255,255,0.06); }
+        #ring-fill {
+            stroke: var(--safe);
+            stroke-dasharray: 565; stroke-dashoffset: 565;
+            transition: stroke-dashoffset .6s ease, stroke .5s, filter .5s;
+            filter: drop-shadow(0 0 6px var(--safe));
+        }
+        .ring-center {
+            position: absolute; inset: 0;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+        }
+        #speed-display { font-family: var(--font-mono); font-size: 4rem; line-height: 1; }
+        .speed-unit { font-size: .75rem; letter-spacing: .25em; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+        #emoji      { font-size: 1.4rem; margin-top: 4px; }
+
+        /* Stat cards — 2-column grid */
+        .cards {
+            width: 100%; max-width: 440px;
+            display: grid; grid-template-columns: 1fr 1fr;
+            gap: 12px; padding: 0 20px; margin-top: 16px;
+        }
+        .card {
+            background: var(--panel); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 14px 16px;
+            position: relative; overflow: hidden;
+        }
+        /* Coloured top stripe to colour-code each stat */
+        .card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background: var(--neutral); }
+        .card.risk-card::before { background: var(--danger); }
+        .card.time-card::before { background: var(--warning); }
+        .card-label { font-size: .65rem; letter-spacing: .25em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+        .card-value { font-family: var(--font-mono); font-size: 1.9rem; line-height: 1; }
+        .card-sub   { font-size: .7rem; color: var(--muted); margin-top: 4px; }
+
+        /* Risk progress bar */
+        .risk-bar-wrap { width: 100%; max-width: 440px; padding: 12px 20px 0; }
+        .risk-bar-label {
+            font-size: .65rem; letter-spacing: .2em; text-transform: uppercase;
+            color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 6px;
+        }
+        .risk-bar-track { height: 6px; background: rgba(255,255,255,.06); border-radius: 100px; overflow: hidden; }
+        /*
+            Gradient fills left→right: green → amber → red.
+            The width% of the fill element determines apparent colour on
+            the gradient — a clever way to show zone with a single element.
+        */
+        #risk-bar-fill {
+            height: 100%; width: 0%; border-radius: 100px;
+            background: linear-gradient(90deg, var(--safe), var(--warning), var(--danger));
+            transition: width .6s ease;
+        }
+
+        /* Status message */
+        .msg-bar { width: 100%; max-width: 440px; margin: 12px 0 0; padding: 0 20px; }
+        #message {
+            background: var(--panel); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 12px 16px;
+            font-size: .88rem; line-height: 1.5; color: var(--muted); min-height: 52px;
+        }
+
+        /* ================================================================
+           NAG BANNER — safety message that appears after 60s of speeding
+        ================================================================ */
+        #nag-banner { width: 100%; max-width: 440px; padding: 0 20px; margin-top: 10px; display: none; }
+        #nag-banner.visible { display: block; }
+        .nag-inner {
+            background: rgba(255,59,48,.1); border: 1px solid rgba(255,59,48,.3);
+            border-radius: var(--radius); padding: 12px 14px;
+            display: flex; gap: 12px; align-items: flex-start;
+            animation: nag-appear .4s ease;
+        }
+        @keyframes nag-appear { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+        .nag-icon  { font-size: 1.3rem; flex-shrink: 0; }
+        #nag-text  { font-size: .86rem; line-height: 1.5; color: #ffb3ae; font-style: italic; }
+        .nag-timer { font-family: var(--font-mono); font-size: .65rem; color: var(--danger); margin-top: 5px; }
+
+        /* ================================================================
+           EVENT LOG — scrollable list of timestamped driving events
+        ================================================================ */
+        .log-section { width: 100%; max-width: 440px; padding: 16px 20px 28px; }
+        .log-header {
+            font-size: .65rem; letter-spacing: .25em; text-transform: uppercase;
+            color: var(--muted); margin-bottom: 10px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .log-header::after { content:''; flex:1; height:1px; background: var(--border); }
+        #risk-log {
+            list-style: none; background: var(--panel); border: 1px solid var(--border);
+            border-radius: var(--radius); max-height: 130px; overflow-y: auto;
+            padding: 4px 0;
+            scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.1) transparent;
+        }
+        #risk-log li {
+            font-family: var(--font-mono); font-size: .72rem;
+            padding: 7px 14px; border-bottom: 1px solid var(--border);
+            color: var(--muted); display: flex; gap: 10px;
+            animation: slide-in .3s ease;
+        }
+        #risk-log li:last-child { border-bottom: none; }
+        @keyframes slide-in { from{opacity:0;transform:translateY(-5px)} to{opacity:1;transform:translateY(0)} }
+        .log-time { color: var(--neutral); flex-shrink: 0; }
+        .log-flag { color: var(--danger); }
+        .empty-log { font-family: var(--font-mono); font-size: .72rem; padding: 14px; text-align: center; color: rgba(255,255,255,.2); }
+
+        /* ================================================================
+           DANGER GAUGE SCREEN
+           ─────────────────────────────────────────────────────────────────
+           Shown automatically when speed exceeds the enforced speed limit.
+           Can also be reached by swiping left on the normal screen.
+           Background has a subtle red radial glow to signal danger.
+        ================================================================ */
+        #screen-danger {
+            background: radial-gradient(ellipse at center, #190404 0%, #0a0c0f 70%);
+            min-height: 100svh;
+        }
+
+        .danger-topbar {
+            width: 100%; max-width: 440px;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 16px 24px 0;
+        }
+        .danger-badge {
+            font-size: .65rem; font-weight: 700; letter-spacing: .22em;
+            text-transform: uppercase; color: var(--danger);
+            padding: 5px 14px; border: 1px solid rgba(255,59,48,.4);
+            border-radius: 100px;
+            animation: dpulse 1.2s ease infinite;
+        }
+        @keyframes dpulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+        .spd-timer-wrap { text-align: right; }
+        .spd-timer-label { font-size: .6rem; letter-spacing: .15em; text-transform: uppercase; color: var(--muted); }
+        #speeding-clock { font-family: var(--font-mono); font-size: 1.05rem; color: var(--danger); }
+
+        /* ── Analogue Gauge Container ── */
+        .gauge-wrap {
+            position: relative;
+            width: min(300px, 86vw);
+            height: min(300px, 86vw);
+            margin: 8px auto 0;
+            flex-shrink: 0;
+        }
+        #gauge-svg { width: 100%; height: 100%; overflow: visible; }
+
+        /* Centred readout overlaid on gauge */
+        .gauge-center {
+            position: absolute; inset: 0;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            pointer-events: none; /* clicks pass through to gauge */
+        }
+        .gc-label  { font-size: .58rem; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+        #gauge-mins {
+            font-family: var(--font-mono); font-size: 2.5rem; line-height: 1;
+            color: var(--warning); text-shadow: 0 0 20px rgba(255,200,32,.5);
+        }
+        #gauge-unit  { font-size: .62rem; letter-spacing: .14em; color: var(--muted); margin-top: 2px; text-transform: uppercase; }
+        #gauge-risk  { font-family: var(--font-mono); font-size: .82rem; color: var(--danger); margin-top: 8px; }
+        #gauge-kph   { font-family: var(--font-mono); font-size: 1.3rem; color: var(--text); margin-top: 3px; }
+        /* Shows how many km/h over the limit the driver is */
+        #gauge-over  { font-family: var(--font-mono); font-size: .75rem; color: var(--danger); margin-top: 2px; }
+
+        /* ── Nag countdown progress bar ── */
+        .nag-countdown-wrap { width: 100%; max-width: 400px; padding: 8px 20px 0; }
+        .nag-countdown-label {
+            font-size: .6rem; letter-spacing: .15em; text-transform: uppercase;
+            color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 5px;
+        }
+        .nag-countdown-track { height: 4px; background: rgba(255,255,255,.06); border-radius: 100px; overflow: hidden; }
+        #nag-countdown-fill {
+            height: 100%; border-radius: 100px;
+            background: var(--danger); width: 0%;
+            transition: width .9s linear;
+        }
+
+        /* ── Safety message card on danger screen ── */
+        #danger-nag { width: 100%; max-width: 400px; margin: 12px auto 0; padding: 0 20px; transition: opacity .5s; }
+        #danger-nag.nag-hidden  { opacity: 0; pointer-events: none; }
+        #danger-nag.nag-visible { opacity: 1; }
+        .danger-nag-box {
+            background: rgba(255,59,48,.1); border: 1px solid rgba(255,59,48,.25);
+            border-radius: var(--radius); padding: 14px 18px; text-align: center;
+        }
+        #danger-nag-text { font-size: .9rem; line-height: 1.6; color: #ffb3ae; font-style: italic; }
+        .dnag-src { font-size: .62rem; letter-spacing: .12em; color: var(--muted); margin-top: 8px; text-transform: uppercase; }
+
+        /* ── "I'll Slow Down" CTA button ── */
+        #btn-slowdown {
+            margin: 16px auto 24px; display: block;
+            font-family: var(--font-head); font-size: .9rem; font-weight: 700;
+            letter-spacing: .2em; text-transform: uppercase;
+            padding: 12px 36px; border: 2px solid var(--danger);
+            border-radius: 100px; background: transparent;
+            color: var(--danger); cursor: pointer;
+            transition: background .2s, color .2s;
+        }
+        #btn-slowdown:active { background: var(--danger); color: #fff; }
+
+        /* ================================================================
+           GLOBAL OVERLAYS
+        ================================================================ */
+        /* Red radial flash when entering extreme-risk zone */
+        #alert-flash {
+            position: fixed; inset: 0; pointer-events: none; z-index: 50; opacity: 0;
+            background: radial-gradient(ellipse at center, rgba(255,59,48,.18) 0%, transparent 70%);
+            transition: opacity .2s;
+        }
+        #alert-flash.on { opacity: 1; }
+
+        /* Amber outline on hard braking detection */
+        body.shock { outline: 3px solid var(--warning); }
+
+        /* ================================================================
+           OSM FETCH STATUS INDICATOR
+           ─────────────────────────────────────────────────────────────────
+           Small inline status inside the limit badge to show the current
+           state of the Overpass API request.
+        ================================================================ */
+        #osm-status {
+            font-size: .58rem; letter-spacing: .08em;
+            color: var(--muted);
+        }
+    </style>
+</head>
+<body>
+
+<!-- ── Global flash overlay ── -->
+<div id="alert-flash"></div>
+
+<!-- ================================================================
+     SPLASH SCREEN
+     ─────────────────────────────────────────────────────────────────
+     The very first thing the user sees. Describes the app and
+     presents a single CTA button. The button tap is the required
+     "user gesture" that unlocks browser sensor + audio APIs.
+================================================================ -->
+<div id="splash">
+    <div class="splash-icon">🛡️</div>
+    <div class="splash-title">SafeDrive</div>
+    <div class="splash-subtitle">Risk vs. Gain Monitor</div>
+    <p class="splash-desc">
+        Real-time physics-based driving risk analysis. GPS speed, live speed
+        limits from OpenStreetMap, accelerometer hard-braking detection, and
+        voice nags after 3 minutes of speeding.
+    </p>
+    <div class="feature-pills">
+        <span class="pill">GPS SPEED</span>
+        <span class="pill">OSM SPEED LIMITS</span>
+        <span class="pill">KINETIC ENERGY</span>
+        <span class="pill">ACCELEROMETER</span>
+        <span class="pill">VOICE NAGS</span>
+        <span class="pill">SWIPE SCREENS</span>
+    </div>
+    <button id="btn-start" onclick="startApp()">BEGIN TRIP</button>
+</div>
+
+<!-- ================================================================
+     SHARED HEADER — always visible above the swipe viewport
+================================================================ -->
+<header>
+    <div class="logo">Safe<span>Drive</span></div>
+
+    <!--
+        SPEED LIMIT BADGE
+        ─────────────────
+        Shows the live-fetched speed limit from OpenStreetMap.
+        States:
+          "—  LIMIT" = not yet fetched (waiting for GPS fix)
+          "50 LIMIT" = fetched, enforcing 50 km/h
+          Red + pulsing = driver is currently over that limit
+    -->
+    <div id="limit-badge">
+        <span id="limit-num">—</span>
+        <span>LIMIT</span>
+        <span id="osm-status">searching…</span>
+    </div>
+
+    <div id="status-dot" title="GPS inactive"></div>
+</header>
+
+<!-- Swipe navigation dots -->
+<div class="swipe-dots">
+    <div class="swipe-dot active" id="dot-0"></div>
+    <div class="swipe-dot"        id="dot-1"></div>
+</div>
+
+<!-- ================================================================
+     SWIPE VIEWPORT — horizontal sliding container
+     ─────────────────────────────────────────────────────────────────
+     #swipe-track holds both screens side-by-side.
+     JavaScript moves it via transform: translateX(0) or translateX(-50%)
+     to show either screen. Touch events detect the swipe gesture.
+================================================================ -->
+<div id="swipe-viewport">
+    <div id="swipe-track">
+
+        <!-- ============================================================
+             SCREEN 0 — NORMAL DASHBOARD
+             (index 0 in the swipe track = initially visible)
+        ============================================================ -->
+        <div id="screen-normal">
+            <section class="speed-section">
+                <div class="ring-wrap">
+                    <svg id="ring-svg" width="210" height="210" viewBox="0 0 210 210">
+                        <circle id="ring-track" cx="105" cy="105" r="90" fill="none" stroke-width="10"/>
+                        <circle id="ring-fill"  cx="105" cy="105" r="90" fill="none" stroke-width="10" stroke-linecap="round"/>
+                    </svg>
+                    <div class="ring-center">
+                        <div id="speed-display">—</div>
+                        <div class="speed-unit">km / h</div>
+                        <div id="emoji">⬤</div>
+                    </div>
+                </div>
+            </section>
+
+            <div class="cards">
+                <div class="card risk-card">
+                    <div class="card-label">Crash Risk</div>
+                    <div class="card-value" id="risk-val">—</div>
+                    <div class="card-sub">× baseline</div>
+                </div>
+                <div class="card time-card">
+                    <div class="card-label">Time Saved</div>
+                    <div class="card-value" id="time-val">—</div>
+                    <div class="card-sub">per 10 km</div>
+                </div>
+            </div>
+
+            <div class="risk-bar-wrap">
+                <div class="risk-bar-label">
+                    <span>Risk Level</span><span id="risk-pct">—</span>
+                </div>
+                <div class="risk-bar-track"><div id="risk-bar-fill"></div></div>
+            </div>
+
+            <div class="msg-bar"><div id="message">Waiting for GPS signal…</div></div>
+
+            <!-- Safety nag banner (appears after 60s speeding) -->
+            <div id="nag-banner">
+                <div class="nag-inner">
+                    <div class="nag-icon">💬</div>
+                    <div>
+                        <div id="nag-text">—</div>
+                        <div class="nag-timer" id="nag-timer">—</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="log-section">
+                <div class="log-header">Trip Risk Log</div>
+                <ul id="risk-log">
+                    <li class="empty-log" id="log-empty">No events recorded yet.</li>
+                </ul>
+            </div>
+        </div><!-- end #screen-normal -->
+
+        <!-- ============================================================
+             SCREEN 1 — DANGER GAUGE
+             (index 1 in the swipe track = off-canvas to the right)
+             Shown automatically when speed > enforced limit.
+             Also reachable by swiping left on screen 0.
+        ============================================================ -->
+        <div id="screen-danger">
+
+            <div class="danger-topbar">
+                <div class="danger-badge">🚨 Extreme Risk</div>
+                <div class="spd-timer-wrap">
+                    <div class="spd-timer-label">Speeding for</div>
+                    <div id="speeding-clock">0:00</div>
+                </div>
+            </div>
+
+            <!--
+                ANALOGUE GAUGE SVG
+                ──────────────────
+                The SVG element is empty here; all arc paths, tick marks,
+                labels and the needle are generated in JavaScript by
+                buildGaugeSVG(). This keeps the HTML clean and makes the
+                gauge fully parametric (radius, sweep, max speed etc. are
+                all constants in JS).
+            -->
+            <div class="gauge-wrap">
+                <svg id="gauge-svg" viewBox="0 0 320 320"></svg>
+                <div class="gauge-center">
+                    <div class="gc-label">Mins Saved / 10 km</div>
+                    <div id="gauge-mins">0:00</div>
+                    <div id="gauge-unit">min : sec</div>
+                    <div id="gauge-risk">Risk: —</div>
+                    <div id="gauge-kph">— km/h</div>
+                    <div id="gauge-over"></div>
+                </div>
+            </div>
+
+            <!-- Nag countdown: fills over the first NAG_VOICE_SECS seconds -->
+            <div class="nag-countdown-wrap">
+                <div class="nag-countdown-label">
+                    <span>Voice nag trigger</span>
+                    <span id="nag-countdown-label">3:00 remaining</span>
+                </div>
+                <div class="nag-countdown-track">
+                    <div id="nag-countdown-fill"></div>
+                </div>
+            </div>
+
+            <!-- Safety message card -->
+            <div id="danger-nag" class="nag-hidden">
+                <div class="danger-nag-box">
+                    <div id="danger-nag-text">—</div>
+                    <div class="dnag-src">SafeDrive Safety Message</div>
+                </div>
+            </div>
+
+            <button id="btn-slowdown" onclick="onSlowDownPressed()">I'LL SLOW DOWN ✓</button>
+
+        </div><!-- end #screen-danger -->
+
+    </div><!-- end #swipe-track -->
+</div><!-- end #swipe-viewport -->
+
+
+<script>
+/* ============================================================
+   SAFEDRIVE v3 — Main JavaScript
+   ─────────────────────────────────────────────────────────────
+   Architecture overview:
+     1. startApp()        — unlocks sensors, begins GPS & accelerometer
+     2. initGPS()         — watchPosition loop → calls updateUI() on each fix
+     3. fetchSpeedLimit() — Overpass API query → sets currentSpeedLimit
+     4. updateUI()        — physics, screen routing, nag timer
+     5. updateNormalScreen() / updateGaugeScreen() — per-screen rendering
+     6. buildGaugeSVG()   — one-time SVG gauge construction
+     7. updateGaugeNeedle() — per-tick needle + arc update
+     8. secondTick()      — 1-second interval for speeding clock & nag engine
+     9. Swipe detection   — touchstart / touchend event handlers
+    10. speak() / speakNag() — throttled SpeechSynthesis wrappers
+============================================================ */
+
+/* ============================================================
+   SAFETY MESSAGE LIBRARY
+   ─────────────────────────────────────────────────────────────
+   140 messages across 4 categories. Cycled in shuffled order
+   so no message repeats until all have been shown.
+   Categories: Personal consequences, Loved ones, Other road
+   users, Logic & philosophy.
+============================================================ */
+const safetyMessages = [
+    // PERSONAL CONSEQUENCES
+    "Your life is worth more than the 30 seconds you're saving.",
+    "At this speed, your reaction time is almost zero.",
+    "Physics doesn't care about your schedule; kinetic energy is doubling.",
+    "Is arriving two minutes early worth a lifetime of physical therapy?",
+    "Speeding makes you a passenger to your own momentum.",
+    "You can't outrun the laws of physics.",
+    "A hospital bed is much slower than a car.",
+    "The faster you go, the harder you hit. It's that simple.",
+    "Speeding doesn't save time; it steals safety.",
+    "Your car is a 2-ton weapon at this velocity.",
+    "Don't trade your future for a few seconds today.",
+    "Adrenaline is temporary; paralysis is permanent.",
+    "Momentum is hard to gain but harder to stop.",
+    "You aren't driving; you're just aiming.",
+    "A crash at this speed is like falling from a 12-story building.",
+    "Your seatbelt can only do so much at this speed.",
+    "The road isn't a video game; there is no respawn.",
+    "Every km/h over the limit narrows your field of vision.",
+    "Braking distance grows faster than your speed.",
+    "Tires lose grip exponentially when you push this hard.",
+    "Don't let your ego drive the car.",
+    "The fastest way home is the safest way home.",
+    "Control is an illusion at high speeds.",
+    "One pebble on the road can end it all right now.",
+    "Your brain cannot process visual data fast enough at this pace.",
+    "An extra 10 km/h doubles the force of impact.",
+    "Focus on the drive, not the deadline.",
+    "Your destination will still be there if you arrive 5 minutes late.",
+    "Speeding is the most common cause of avoidable death.",
+    "Your life is the only thing you truly own. Don't waste it.",
+    "Safety is a choice you make every second.",
+    "Slow down. The world is beautiful; see it.",
+    "Check your speedometer; it's a warning, not a challenge.",
+    "Fatigue plus speed equals fatality. Slow down.",
+    "The thrill of speed is not worth the chill of the morgue.",
+    // LOVED ONES
+    "Someone is waiting for you at home. Don't make them wait forever.",
+    "Your family wants you back in one piece, not on time.",
+    "Imagine the phone call your family would receive right now.",
+    "Is saving a minute worth leaving your partner alone?",
+    "Slow down. Your parents aren't ready to bury you.",
+    "Your empty chair at dinner isn't worth the speed.",
+    "Drive like your kids are in the backseat.",
+    "The people who love you would rather you be late.",
+    "Would your mother be comfortable at this speed?",
+    "Think of the faces of the people who need you.",
+    "A funeral is a very expensive way to be on time.",
+    "No one wants to visit you in the intensive care unit.",
+    "Is this speed worth making your children orphans?",
+    "Don't break your family's heart just to shave off a few seconds.",
+    "Drive so you can see your grandkids grow up.",
+    "Your partner deserves to grow old with you.",
+    "Your siblings need their brother or sister today.",
+    "Don't make your best friend deliver your eulogy.",
+    "Home is where the heart is; keep yours beating.",
+    "Think of the birthdays you haven't celebrated yet.",
+    "Your family is your real destination.",
+    "Don't let hurry be the reason you never say goodbye.",
+    "Safety is the ultimate act of love for your family.",
+    "The ones who love you don't care if you're 10 minutes late.",
+    "A car can be replaced; a parent cannot.",
+    "Your family relies on your good judgment.",
+    "Don't turn a happy day into a day of mourning.",
+    "The risk you take is a risk they have to live with.",
+    "Imagine your child's wedding without you there.",
+    "Protect the people who rely on you.",
+    "Your absence would be a silence that never ends.",
+    "Slow down for the people who call you home.",
+    "Drive like everyone you love is on the road with you.",
+    "A life lost to speed is a hole that never heals.",
+    "Keep your family whole. Slow down.",
+    // OTHERS ON THE ROAD
+    "At 50 km/h they live. At 70 km/h they die. Choose life.",
+    "A child could step out at any moment. Could you stop?",
+    "That pedestrian has a family too.",
+    "Their survival depends entirely on your speedometer.",
+    "You might survive the crash; the person you hit won't.",
+    "A moment of your haste could mean a lifetime of grief for a stranger.",
+    "Small speeds save small people. Slow near schools.",
+    "To you it's a shortcut. To a pedestrian it's a death sentence.",
+    "Be the driver you'd want to see when you are walking.",
+    "Bicycles are fragile; your car is not. Give them space.",
+    "A pedestrian hit at 60 km/h has a 90% chance of death.",
+    "The road belongs to everyone, not just the fast.",
+    "Don't let your hurry become someone else's tragedy.",
+    "Children don't understand physics. You do. Slow down.",
+    "Elderly pedestrians need more time. Give it to them.",
+    "The person crossing the street is someone's everything.",
+    "A ball in the street usually has a child behind it.",
+    "Speeding in a neighborhood is an act of aggression.",
+    "Stopping distance at 80 km/h is double that of 50 km/h.",
+    "The safety of others is in your right foot.",
+    "You can't take back a collision.",
+    "Respect the crosswalk; it's a sanctuary.",
+    "Every pedestrian is a person, not a target.",
+    "A cyclist's life is worth more than your momentum.",
+    "Human bodies were not meant to withstand car impacts.",
+    "Be patient with the slow; they want to get home too.",
+    "Drive as if your own grandmother is crossing the street.",
+    "Others' lives are not yours to risk.",
+    "Watch for shadows between parked cars.",
+    "Be the reason someone gets home safely today.",
+    "Don't let your car be a weapon of mass destruction.",
+    "Your speed is a threat to the entire community.",
+    "Don't make a stranger pay for your lack of time management.",
+    "A school zone is a place for learning, not for speed.",
+    "Give the gift of safety to those walking by.",
+    // LOGIC & PHILOSOPHY
+    "Roads are a shared space, not a race track.",
+    "Don't force others to pay for your hurry.",
+    "Aggressive driving is just a lack of self-control.",
+    "Courtesy is the best safety feature your car has.",
+    "Speeding: the ultimate gamble where the house always wins.",
+    "If you're in a hurry, you should have left earlier.",
+    "Arriving on time is a social construct. Survival is biological.",
+    "The engine produces power; you must produce the wisdom.",
+    "You are currently saving 4 seconds. Is that worth a life?",
+    "Traffic lights are the great equalizers of speeders.",
+    "You'll just be first in line at the next red light.",
+    "Speed is a substitute for planning. Plan better.",
+    "The most advanced safety feature is between your ears.",
+    "Don't let your car's horsepower exceed your brainpower.",
+    "Driving is a privilege, not a right to endanger others.",
+    "Calmness is the best engine oil.",
+    "Racing the clock is a race you will eventually lose.",
+    "The road doesn't care how fast your car is.",
+    "A fast car doesn't make a fast mind.",
+    "Patience is the difference between a trip and a tragedy.",
+    "Your destination isn't going anywhere. Relax.",
+    "Speed is the illusion of progress.",
+    "Real skill is avoiding the crash, not driving fast.",
+    "A minute of patience can prevent ten years of regret.",
+    "Don't let a bad mood drive the car.",
+    "Stress plus speed equals disaster.",
+    "The road is a mirror of your character. Drive well.",
+    "Don't be a statistic; be a success story.",
+    "Life is a marathon, not a sprint.",
+    "The best drivers are the ones you never notice.",
+    "Don't let the car drive you.",
+    "Common sense is your best GPS.",
+    "Speeding is an act of selfishness.",
+    "Wisdom is knowing when to slow down.",
+    "The goal is arrival, not velocity."
+];
+
+/* ============================================================
+   CONFIGURATION CONSTANTS
+   ─────────────────────────────────────────────────────────────
+   All threshold values in one place for easy tuning.
+============================================================ */
+const SAFE_SPEED_FALLBACK = 50;  // km/h — used if OSM returns no data
+const DISTANCE            = 10;  // km — distance used in time-saved formula
+const RING_CIRC           = 2 * Math.PI * 90; // SVG arc circumference (r=90)
+const MAX_RING_SPEED      = 130; // km/h at which ring is fully filled
+const GAUGE_MAX           = 160; // km/h shown at the end of the gauge dial
+const NAG_SHOW_SECS       = 60;  // seconds over limit before text nag appears
+const NAG_VOICE_SECS      = 180; // seconds over limit before voice nags start (3 min)
+const NAG_VOICE_INTERVAL  = 30;  // seconds between successive voice nags
+const OSM_FETCH_RADIUS    = 30;  // metres — Overpass query radius around coords
+const OSM_REFETCH_DIST    = 100; // metres — re-query OSM if moved this far
+
+/* ============================================================
+   RUNTIME STATE
+============================================================ */
+let currentSpeedLimit = SAFE_SPEED_FALLBACK; // km/h — updated by fetchSpeedLimit()
+let osmFetching       = false;               // prevents concurrent OSM requests
+let lastOsmLat        = null;                // coords of last successful OSM query
+let lastOsmLng        = null;
+let lastLogTime       = 0;
+let lastSpeechTime    = 0;
+let hasLogEntries     = false;
+let inDangerScreen    = false;  // tracks which screen is visible
+let gaugeSvgBuilt     = false;  // buildGaugeSVG() called only once
+let gaugeNeedle       = null;   // SVG <g> element — the needle
+let gaugeFillArc      = null;   // SVG <path> element — active fill arc
+let gaugeLimitMarker  = null;   // SVG <line> element — speed limit tick
+
+// Speeding timer
+let speedingStart     = null;   // Date.now() timestamp when speeding began
+let speedingSeconds   = 0;      // elapsed seconds of continuous speeding
+
+// Nag message engine
+let nagPool           = [];     // shuffled copy of safetyMessages
+let nagIndex          = -1;     // current position in pool
+let currentNagMsg     = '';     // message currently being displayed
+let lastNagShowTime   = 0;      // timestamp of last text nag update
+let lastNagVoiceTime  = 0;      // timestamp of last voice nag
+
+/* ============================================================
+   DOM ELEMENT REFERENCES
+   ─────────────────────────────────────────────────────────────
+   Collecting all references up-front avoids repeated getElementById()
+   calls in hot paths (GPS/animation loops).
+============================================================ */
+const dom = {
+    splash:         document.getElementById('splash'),
+    statusDot:      document.getElementById('status-dot'),
+    limitBadge:     document.getElementById('limit-badge'),
+    limitNum:       document.getElementById('limit-num'),
+    osmStatus:      document.getElementById('osm-status'),
+    swipeTrack:     document.getElementById('swipe-track'),
+    dot0:           document.getElementById('dot-0'),
+    dot1:           document.getElementById('dot-1'),
+    screenNormal:   document.getElementById('screen-normal'),
+    screenDanger:   document.getElementById('screen-danger'),
+    speedDisp:      document.getElementById('speed-display'),
+    emoji:          document.getElementById('emoji'),
+    riskVal:        document.getElementById('risk-val'),
+    timeVal:        document.getElementById('time-val'),
+    message:        document.getElementById('message'),
+    ringFill:       document.getElementById('ring-fill'),
+    barFill:        document.getElementById('risk-bar-fill'),
+    riskPct:        document.getElementById('risk-pct'),
+    log:            document.getElementById('risk-log'),
+    logEmpty:       document.getElementById('log-empty'),
+    flash:          document.getElementById('alert-flash'),
+    nagBanner:      document.getElementById('nag-banner'),
+    nagText:        document.getElementById('nag-text'),
+    nagTimer:       document.getElementById('nag-timer'),
+    speedingClock:  document.getElementById('speeding-clock'),
+    gaugeMins:      document.getElementById('gauge-mins'),
+    gaugeRisk:      document.getElementById('gauge-risk'),
+    gaugeKph:       document.getElementById('gauge-kph'),
+    gaugeOver:      document.getElementById('gauge-over'),
+    dangerNag:      document.getElementById('danger-nag'),
+    dangerNagText:  document.getElementById('danger-nag-text'),
+    nagCountFill:   document.getElementById('nag-countdown-fill'),
+    nagCountLabel:  document.getElementById('nag-countdown-label'),
+};
+
+/* ============================================================
+   UTILITY FUNCTIONS
+============================================================ */
+
+/** Fisher-Yates shuffle — creates a new randomly ordered array */
+function shuffle(arr) {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+/**
+ * Format seconds into a human-readable string.
+ * < 60s → "45s"
+ * ≥ 60s → "2m 15s"
+ */
+function fmtTime(secs) {
+    secs = Math.round(secs);
+    if (secs < 60) return `${secs}s`;
+    return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+/** Format seconds as MM:SS (e.g. 185 → "3:05") */
+function fmtMmSs(secs) {
+    secs = Math.round(secs);
+    return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Haversine distance between two lat/lng points.
+ * Returns distance in metres.
+ * Used to decide when to re-query OSM (moved > OSM_REFETCH_DIST metres).
+ */
+function haversineMetres(lat1, lng1, lat2, lng2) {
+    const R = 6371000; // Earth radius in metres
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 +
+              Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+              Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/* ============================================================
+   START APP
+   ─────────────────────────────────────────────────────────────
+   Called by the splash "BEGIN TRIP" button.
+   Must be triggered by a direct user gesture (tap) to unlock:
+     • navigator.geolocation — requires permission dialog
+     • DeviceMotionEvent.requestPermission() — iOS 13+ only
+     • window.speechSynthesis.speak() — blocked without gesture
+============================================================ */
+async function startApp() {
+    dom.splash.classList.add('hidden');
+
+    // Initialise nag message pool
+    nagPool = shuffle(safetyMessages);
+
+    /*
+        iOS motion permission
+        ─────────────────────
+        On iOS 13+, DeviceMotionEvent.requestPermission is a function.
+        On Android and desktop it doesn't exist, so we guard with typeof.
+        We don't block on failure — accelerometer is bonus functionality.
+    */
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+        try { await DeviceMotionEvent.requestPermission(); }
+        catch(e) { console.warn('Motion permission denied:', e); }
+    }
+
+    speak("Safety monitor active. Drive carefully.");
+    initGPS();
+    initAccelerometer();
+    initSwipe();
+
+    /*
+        1-second interval ticker
+        ────────────────────────
+        GPS fires whenever position changes (typically every 1–5s on mobile).
+        The speeding clock and nag engine need a consistent 1-second tick
+        regardless of GPS update rate, so we run a separate setInterval.
+    */
+    setInterval(secondTick, 1000);
+}
+
+/* ============================================================
+   OPENSTREETMAP SPEED LIMIT FETCHER
+   ─────────────────────────────────────────────────────────────
+   Uses the Overpass API (https://overpass-api.de) — a free,
+   read-only query API for OpenStreetMap data.
+
+   Query strategy:
+     1. Build a bounding box around the current GPS position.
+     2. Request all highway ways within OSM_FETCH_RADIUS metres.
+     3. Parse "maxspeed" tags from the returned JSON.
+     4. Prefer the nearest way's limit; fall back to default 50.
+
+   OSM "maxspeed" values can be:
+     • "50"         → plain number in km/h
+     • "50 mph"     → miles per hour (converted × 1.609)
+     • "DE:urban"   → country-specific zone tag (handled as 50 fallback)
+     • Missing tag  → road has no explicit limit; fallback to urban default
+
+   Rate limiting:
+     • We only re-fetch if the vehicle has moved > OSM_REFETCH_DIST metres
+       from the last successful query coordinates.
+     • osmFetching flag prevents overlapping concurrent requests.
+============================================================ */
+async function fetchSpeedLimit(lat, lng) {
+    /*
+        Decide whether a new query is needed.
+        Skip if:
+          a) A request is already in flight (osmFetching)
+          b) We haven't moved far enough to need a new road segment
+    */
+    if (osmFetching) return;
+    if (lastOsmLat !== null) {
+        const dist = haversineMetres(lat, lng, lastOsmLat, lastOsmLng);
+        if (dist < OSM_REFETCH_DIST) return; // still on same road segment
+    }
+
+    osmFetching = true;
+    dom.osmStatus.textContent = 'fetching…';
+
+    /*
+        Overpass QL query
+        ─────────────────
+        [out:json]    — return JSON (not XML)
+        [timeout:8]   — server-side timeout in seconds
+        way(around:RADIUS,LAT,LNG)[highway]  — all highway ways near coords
+        out tags;     — we only need the tag data (not geometry)
+    */
+    const query = `
+        [out:json][timeout:8];
+        way(around:${OSM_FETCH_RADIUS},${lat.toFixed(6)},${lng.toFixed(6)})[highway];
+        out tags;
+    `;
+    const url = 'https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query);
+
+    try {
+        const res  = await fetch(url);
+        const data = await res.json();
+
+        /*
+            Parse maxspeed from the first way that has one.
+            OSM ways are ordered by proximity in the response.
+            We iterate until we find a usable value.
+        */
+        let foundLimit = null;
+        for (const element of data.elements) {
+            const tag = element.tags && element.tags.maxspeed;
+            if (!tag) continue;
+
+            if (/^\d+$/.test(tag)) {
+                // Plain integer — already km/h
+                foundLimit = parseInt(tag, 10);
+                break;
+            } else if (/^\d+\s*mph$/i.test(tag)) {
+                // Miles per hour — convert to km/h
+                foundLimit = Math.round(parseFloat(tag) * 1.60934);
+                break;
+            } else if (/^\d+\s*km\/h$/i.test(tag)) {
+                // Explicit km/h tag (uncommon but valid)
+                foundLimit = parseInt(tag, 10);
+                break;
+            }
+            // Zone tags like "DE:urban", "RU:urban", "national", "walk"
+            // are ignored and we fall through to the next way.
+        }
+
+        if (foundLimit && foundLimit > 0 && foundLimit <= 200) {
+            currentSpeedLimit = foundLimit;
+            lastOsmLat = lat;
+            lastOsmLng = lng;
+            dom.limitNum.textContent  = foundLimit;
+            dom.osmStatus.textContent = 'OSM ✓';
+            dom.limitBadge.classList.add('enforcing');
+            logEvent('LIMIT UPDATED', `${foundLimit} km/h from OpenStreetMap`);
+
+            // Rebuild gauge zone arcs to reflect new limit
+            if (gaugeSvgBuilt) rebuildGaugeZones();
+        } else {
+            // No maxspeed tag found — keep current limit, note the miss
+            dom.osmStatus.textContent = 'no tag';
+        }
+
+    } catch (err) {
+        /*
+            Network failure (offline, Overpass overloaded, CORS).
+            We silently keep the last known limit and show an indicator.
+            The app remains fully functional with the fallback.
+        */
+        dom.osmStatus.textContent = 'offline';
+        console.warn('OSM fetch failed:', err);
+    } finally {
+        osmFetching = false;
+    }
+}
+
+/* ============================================================
+   GPS — navigator.geolocation.watchPosition
+   ─────────────────────────────────────────────────────────────
+   watchPosition fires a callback every time position changes.
+   pos.coords.speed is in metres/second; × 3.6 converts to km/h.
+   enableHighAccuracy requests the GPS chip rather than
+   cell-tower/WiFi triangulation (more accurate but uses more battery).
+============================================================ */
+function initGPS() {
+    if (!('geolocation' in navigator)) {
+        dom.message.textContent = 'GPS not available on this device.';
+        return;
+    }
+
+    navigator.geolocation.watchPosition(
+        pos => {
+            dom.statusDot.classList.add('active');
+
+            const speed = Math.max(0, (pos.coords.speed || 0) * 3.6);
+            const lat   = pos.coords.latitude;
+            const lng   = pos.coords.longitude;
+
+            // Attempt to fetch/update the speed limit for this location.
+            // fetchSpeedLimit() guards internally against over-querying.
+            fetchSpeedLimit(lat, lng);
+
+            updateUI(speed);
+        },
+        err => {
+            dom.message.textContent = '⚠ Location access denied. Please enable GPS.';
+            console.error('GPS error:', err);
+        },
+        { enableHighAccuracy: true, maximumAge: 1000 }
+    );
+}
+
+/* ============================================================
+   ACCELEROMETER — DeviceMotionEvent
+   ─────────────────────────────────────────────────────────────
+   event.acceleration gives linear acceleration excluding gravity,
+   in metres per second squared (m/s²).
+
+   Vector magnitude formula:  |a| = √(x² + y² + z²)
+   Threshold: 6 m/s² ≈ 0.6g — a significant sudden deceleration
+   (hard braking) or lateral acceleration (sharp cornering).
+   Normal driving rarely exceeds 3 m/s².
+
+   Note: event.accelerationIncludingGravity includes ~9.8 m/s² on
+   the vertical axis. We use event.acceleration (gravity-compensated)
+   to avoid false positives when the phone is tilted.
+============================================================ */
+function initAccelerometer() {
+    window.addEventListener('devicemotion', e => {
+        const a = e.acceleration;
+        if (!a || (a.x == null && a.y == null && a.z == null)) return;
+
+        const force = Math.sqrt((a.x || 0)**2 + (a.y || 0)**2 + (a.z || 0)**2);
+
+        if (force > 6) {
+            logEvent('HARD MANEUVER', `G-force: ${force.toFixed(1)} m/s²`);
+            // Visual shock — brief amber outline
+            document.body.classList.add('shock');
+            setTimeout(() => document.body.classList.remove('shock'), 400);
+            speak("Hard maneuver detected.");
+        }
+    });
+}
+
+/* ============================================================
+   SWIPE NAVIGATION
+   ─────────────────────────────────────────────────────────────
+   Detects horizontal touch swipes on the swipe viewport and
+   slides between screen-normal (index 0) and screen-danger (index 1).
+
+   How it works:
+     • touchstart  — record the starting X position
+     • touchmove   — optionally apply real-time drag (for "feel")
+     • touchend    — if horizontal delta > threshold, commit the swipe
+
+   We track touchId to handle multi-touch gracefully (only follow
+   the first finger that initiated the swipe).
+
+   swipeCurrentIndex: 0 = normal screen, 1 = danger screen
+============================================================ */
+let swipeCurrentIndex = 0;
+let touchStartX       = 0;
+let touchStartY       = 0;
+let touchId           = null;
+const SWIPE_THRESHOLD = 60; // minimum px horizontal movement to commit
+
+function initSwipe() {
+    const viewport = document.getElementById('swipe-viewport');
+
+    viewport.addEventListener('touchstart', e => {
+        /*
+            Only track the first touch if no gesture is in progress.
+            e.changedTouches[0] is the new finger that just touched down.
+        */
+        if (touchId !== null) return;
+        const t    = e.changedTouches[0];
+        touchId    = t.identifier;
+        touchStartX = t.clientX;
+        touchStartY = t.clientY;
+    }, { passive: true });
+
+    viewport.addEventListener('touchend', e => {
+        // Find the touch that just lifted
+        const t = Array.from(e.changedTouches).find(c => c.identifier === touchId);
+        if (!t) return;
+        touchId = null;
+
+        const dx = t.clientX - touchStartX;
+        const dy = t.clientY - touchStartY;
+
+        /*
+            Only trigger a swipe if:
+              • Horizontal movement > threshold (intentional swipe)
+              • Horizontal movement > vertical movement (not a scroll)
+        */
+        if (Math.abs(dx) < SWIPE_THRESHOLD || Math.abs(dx) < Math.abs(dy)) return;
+
+        if (dx < 0 && swipeCurrentIndex === 0) {
+            // Swipe LEFT → go to danger gauge screen
+            goToScreen(1);
+        } else if (dx > 0 && swipeCurrentIndex === 1) {
+            // Swipe RIGHT → go back to normal dashboard
+            goToScreen(0);
+        }
+    }, { passive: true });
+}
+
+/**
+ * goToScreen(index)
+ * ─────────────────
+ * Slides the swipe track to show the screen at `index`.
+ *   index 0 → translateX(0)    = normal screen visible
+ *   index 1 → translateX(-50%) = danger screen visible (50% of 200% = 100vw)
+ *
+ * Also updates the navigation dots.
+ */
+function goToScreen(index) {
+    swipeCurrentIndex = index;
+    dom.swipeTrack.style.transform = index === 0 ? 'translateX(0)' : 'translateX(-50%)';
+    dom.dot0.classList.toggle('active', index === 0);
+    dom.dot1.classList.toggle('active', index === 1);
+
+    // If manually swiping to danger screen, build the gauge SVG if not yet built
+    if (index === 1 && !gaugeSvgBuilt) buildGaugeSVG();
+}
+
+/* ============================================================
+   MAIN UI UPDATE
+   ─────────────────────────────────────────────────────────────
+   Called on every GPS position update.
+   Computes physics values, manages the speeding timer, routes
+   to the correct screen, and throttles log/voice outputs.
+
+   Physics used:
+   ─────────────
+   Risk multiplier (kinetic energy ratio):
+       R = (v / v₀)²
+   where v₀ = currentSpeedLimit (fetched from OSM or fallback 50)
+
+   Time saved per 10 km vs. driving at v₀:
+       ΔT = (10/v₀ − 10/v) × 3600   [seconds]
+   This shows the futility of speeding — at high speeds the
+   time saving approaches a plateau while risk grows without bound.
+============================================================ */
+function updateUI(speed) {
+
+    /*
+        Risk Multiplier
+        ───────────────
+        Kinetic energy is proportional to v².
+        At twice the speed limit → 4× the crash energy.
+        At three times → 9×. The exponential growth is the key insight.
+    */
+    const risk = speed > 0 ? Math.pow(speed / currentSpeedLimit, 2) : 0;
+
+    /*
+        Time Saved
+        ──────────
+        Time = Distance / Speed.
+        At 50 km/h: 10km takes 720 seconds (12 minutes).
+        At 100 km/h: 10km takes 360 seconds.
+        Saving = 360s. But risk is 4×. Not worth it.
+    */
+    const timeSafe     = (DISTANCE / currentSpeedLimit) * 3600;
+    const timeCurrent  = speed > 0 ? (DISTANCE / speed) * 3600 : timeSafe;
+    const secondsSaved = Math.max(0, timeSafe - timeCurrent);
+
+    /*
+        Update speed limit badge colour
+        ────────────────────────────────
+        Normal → amber tint = limit known and being enforced
+        Over limit → red + pulsing = actively speeding
+    */
+    dom.limitNum.textContent = currentSpeedLimit;
+    if (speed > currentSpeedLimit) {
+        dom.limitBadge.classList.add('over-limit');
+        dom.limitBadge.classList.remove('enforcing');
+    } else {
+        dom.limitBadge.classList.remove('over-limit');
+        dom.limitBadge.classList.add('enforcing');
+    }
+
+    /*
+        SPEEDING TIMER
+        ──────────────
+        Track continuous time spent above the speed limit.
+        Reset when speed drops back to legal.
+    */
+    if (speed > currentSpeedLimit) {
+        if (speedingStart === null) speedingStart = Date.now();
+    } else {
+        if (speedingStart !== null) {
+            // Just slowed back down — log the duration
+            logEvent('SPEEDING ENDED', `Duration: ${fmtTime(speedingSeconds)}`);
+        }
+        speedingStart   = null;
+        speedingSeconds = 0;
+        dom.speedingClock.textContent = '0:00';
+        dom.speedingClock.style.color = '';
+        dom.nagCountFill.style.width  = '0%';
+        clearNag();
+    }
+
+    /*
+        SCREEN ROUTING
+        ──────────────
+        If speed > currentSpeedLimit: auto-show the danger gauge screen.
+        Otherwise: show the normal dashboard.
+
+        The driver can still manually swipe between screens at any time.
+        Auto-routing only triggers a programmatic slide, not a lock.
+    */
+    if (speed > currentSpeedLimit) {
+        if (!inDangerScreen) {
+            inDangerScreen = true;
+            buildGaugeSVG();
+            goToScreen(1);
+            speak(`Over the limit. Crash energy is ${risk.toFixed(0)} times higher. Slow down.`);
+            flashDanger();
+        }
+        updateGaugeScreen(speed, secondsSaved, risk);
+
+        // Throttled log entry (max once every 20s to avoid log spam)
+        if (Date.now() - lastLogTime > 20000) {
+            logEvent('SPEEDING', `${Math.round(speed)} km/h — Limit: ${currentSpeedLimit} — Risk: ${risk.toFixed(1)}×`);
+            lastLogTime = Date.now();
+        }
+
+    } else {
+        if (inDangerScreen) {
+            inDangerScreen = false;
+            goToScreen(0);
+        }
+        updateNormalScreen(speed, risk, secondsSaved);
+    }
+}
+
+/* ============================================================
+   NORMAL SCREEN UPDATE
+   ─────────────────────────────────────────────────────────────
+   Updates all elements on the main dashboard (ring, cards,
+   bar, message). Called every GPS tick when not in danger zone.
+============================================================ */
+function updateNormalScreen(speed, risk, secondsSaved) {
+    /*
+        Ring fill calculation:
+        strokeDashoffset = CIRC × (1 − fillRatio)
+        fillRatio = speed / MAX_RING_SPEED, clamped to [0,1]
+        → Higher speed = smaller offset = more arc visible
+    */
+    const fillRatio  = Math.min(speed / MAX_RING_SPEED, 1);
+    const dashOffset = RING_CIRC * (1 - fillRatio);
+
+    // Risk bar: 100% = 4× the crash energy of the speed limit
+    const barPct = Math.min((risk / 4) * 100, 100);
+
+    let color, emojiChar, msgText;
+
+    if (speed <= currentSpeedLimit) {
+        color     = 'var(--safe)';
+        emojiChar = '✅';
+        msgText   = `Optimal speed. Crash energy is ${risk.toFixed(2)}× baseline — low risk.`;
+    } else {
+        // Warning zone: over limit but auto-swipe not yet triggered
+        // (speed slightly above limit — the gap before danger zone logic fires)
+        color     = 'var(--warning)';
+        emojiChar = '⚠️';
+        msgText   = `Over the ${currentSpeedLimit} km/h limit. Saving only ${fmtTime(secondsSaved)}/10 km — is it worth ${risk.toFixed(1)}× the risk?`;
+        speak(`Warning. You are over the speed limit. Risk is ${risk.toFixed(1)} times higher.`);
+        flashDanger();
+    }
+
+    dom.speedDisp.textContent              = Math.round(speed);
+    dom.emoji.textContent                  = emojiChar;
+    dom.riskVal.textContent                = risk.toFixed(2) + '×';
+    dom.timeVal.textContent                = '+' + fmtTime(secondsSaved);
+    dom.message.textContent                = msgText;
+    dom.ringFill.style.strokeDashoffset    = dashOffset;
+    dom.ringFill.style.stroke              = color;
+    dom.ringFill.style.filter              = `drop-shadow(0 0 8px ${color})`;
+    dom.barFill.style.width                = barPct + '%';
+    dom.riskPct.textContent                = barPct.toFixed(0) + '%';
+}
+
+/* ============================================================
+   DANGER GAUGE SCREEN UPDATE
+   ─────────────────────────────────────────────────────────────
+   Updates the analogue gauge readouts on each GPS tick.
+============================================================ */
+function updateGaugeScreen(speed, secondsSaved, risk) {
+    // Update the rotating needle to reflect current speed
+    updateGaugeNeedle(speed);
+
+    // Centre readout: Minutes:Seconds saved per 10 km
+    const minSaved = secondsSaved / 60;
+    const mInt = Math.floor(minSaved);
+    const mSec = Math.round((minSaved - mInt) * 60);
+    dom.gaugeMins.textContent = `${mInt}:${String(mSec).padStart(2, '0')}`;
+
+    dom.gaugeRisk.textContent = `Risk: ${risk.toFixed(1)}× crash energy`;
+    dom.gaugeKph.textContent  = `${Math.round(speed)} km/h`;
+
+    // "Over limit" indicator
+    const overBy = Math.max(0, Math.round(speed - currentSpeedLimit));
+    dom.gaugeOver.textContent = overBy > 0 ? `+${overBy} over limit` : '';
+}
+
+/* ============================================================
+   GAUGE SVG BUILDER
+   ─────────────────────────────────────────────────────────────
+   Called once on first entry to the danger screen (or on manual swipe).
+   Constructs the entire analogue speedometer from scratch using SVG
+   elements created via createElementNS (namespace required for SVG).
+
+   Coordinate system:
+     Centre: (160, 160) in a 320×320 viewBox
+     Radius: 120px
+     Start angle: 135° (bottom-left, 7 o'clock position)
+     Sweep: 270° (ends at bottom-right, 5 o'clock position)
+     0 km/h at 135°, GAUGE_MAX km/h at 405°
+
+   Arc drawing:
+     SVG arc path: M x1 y1 A rx ry x-rotation large-arc-flag sweep-flag x2 y2
+     large-arc-flag: 1 if arc > 180°, 0 otherwise
+     sweep-flag: 1 = clockwise (always, for our gauge)
+============================================================ */
+function buildGaugeSVG() {
+    if (gaugeSvgBuilt) return;
+    gaugeSvgBuilt = true;
+
+    const svg    = document.getElementById('gauge-svg');
+    const svgNS  = 'http://www.w3.org/2000/svg';
+    const cx     = 160, cy = 160, r = 120;
+    const startDeg = 135, sweepDeg = 270;
+
+    /** Convert polar angle (degrees) + radius to Cartesian SVG point */
+    function toRad(deg) { return (deg - 90) * Math.PI / 180; }
+    function pt(deg, radius) {
+        const rad = toRad(deg);
+        return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+    }
+
+    /** Build an SVG arc path element */
+    function mkArc(radius, a1, a2, stroke, width, opacity = 1) {
+        const large = (a2 - a1) > 180 ? 1 : 0;
+        const s = pt(a1, radius), e = pt(a2, radius);
+        const el = document.createElementNS(svgNS, 'path');
+        el.setAttribute('d', `M${s.x} ${s.y} A${radius} ${radius} 0 ${large} 1 ${e.x} ${e.y}`);
+        el.setAttribute('fill', 'none');
+        el.setAttribute('stroke', stroke);
+        el.setAttribute('stroke-width', String(width));
+        el.setAttribute('stroke-linecap', 'round');
+        el.setAttribute('opacity', String(opacity));
+        return el;
+    }
+
+    /** Helper: angle in degrees for a given speed on the dial */
+    const degAt = spd => startDeg + (Math.min(spd, GAUGE_MAX) / GAUGE_MAX) * sweepDeg;
+
+    // ── Glow filter for needle hub ──
+    const defs = document.createElementNS(svgNS, 'defs');
+    defs.innerHTML = `
+        <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+        </filter>`;
+    svg.appendChild(defs);
+
+    // ── Track arc (background) ──
+    svg.appendChild(mkArc(r, startDeg, startDeg + sweepDeg, 'rgba(255,255,255,0.07)', 22));
+
+    // ── Zone arcs (safe / warning / danger) ──
+    // These are rebuilt in rebuildGaugeZones() when the speed limit changes
+    rebuildGaugeZones();
+
+    // ── Active fill arc (red trace showing current speed) ──
+    gaugeFillArc = document.createElementNS(svgNS, 'path');
+    gaugeFillArc.setAttribute('fill', 'none');
+    gaugeFillArc.setAttribute('stroke', '#ff3b30');
+    gaugeFillArc.setAttribute('stroke-width', '5');
+    gaugeFillArc.setAttribute('stroke-linecap', 'round');
+    gaugeFillArc.setAttribute('opacity', '0.85');
+    svg.appendChild(gaugeFillArc);
+
+    // ── Speed limit marker (triangle tick) ──
+    gaugeLimitMarker = document.createElementNS(svgNS, 'polygon');
+    gaugeLimitMarker.setAttribute('fill', '#ffc820');
+    gaugeLimitMarker.setAttribute('opacity', '0.9');
+    svg.appendChild(gaugeLimitMarker);
+    updateLimitMarker(); // position it at currentSpeedLimit
+
+    // ── Tick marks and speed labels ──
+    for (let spd = 0; spd <= GAUGE_MAX; spd += 10) {
+        const angle   = degAt(spd);
+        const isMajor = spd % 40 === 0;
+        const outer   = pt(angle, r + (isMajor ? 14 : 9));
+        const inner   = pt(angle, r - (isMajor ? 14 : 9));
+
+        const line = document.createElementNS(svgNS, 'line');
+        line.setAttribute('x1', inner.x); line.setAttribute('y1', inner.y);
+        line.setAttribute('x2', outer.x); line.setAttribute('y2', outer.y);
+        line.setAttribute('stroke', `rgba(255,255,255,${isMajor ? 0.5 : 0.2})`);
+        line.setAttribute('stroke-width', isMajor ? '2' : '1');
+        svg.appendChild(line);
+
+        if (isMajor) {
+            const lp = pt(angle, r + 30);
+            const t = document.createElementNS(svgNS, 'text');
+            t.setAttribute('x', lp.x); t.setAttribute('y', lp.y);
+            t.setAttribute('text-anchor', 'middle');
+            t.setAttribute('dominant-baseline', 'middle');
+            t.setAttribute('fill', 'rgba(255,255,255,0.45)');
+            t.setAttribute('font-size', '11');
+            t.setAttribute('font-family', 'Share Tech Mono, monospace');
+            t.textContent = spd;
+            svg.appendChild(t);
+        }
+    }
+
+    // ── "KM/H" label at the bottom ──
+    const lbl = document.createElementNS(svgNS, 'text');
+    lbl.setAttribute('x', cx); lbl.setAttribute('y', cy + 98);
+    lbl.setAttribute('text-anchor', 'middle');
+    lbl.setAttribute('fill', 'rgba(255,255,255,0.25)');
+    lbl.setAttribute('font-size', '9');
+    lbl.setAttribute('font-family', 'Share Tech Mono, monospace');
+    lbl.setAttribute('letter-spacing', '2');
+    lbl.textContent = 'KM/H';
+    svg.appendChild(lbl);
+
+    // ── Speed limit text label near the marker ──
+    const limitLbl = document.createElementNS(svgNS, 'text');
+    limitLbl.id = 'gauge-limit-lbl';
+    limitLbl.setAttribute('fill', '#ffc820');
+    limitLbl.setAttribute('font-size', '10');
+    limitLbl.setAttribute('font-family', 'Share Tech Mono, monospace');
+    limitLbl.setAttribute('text-anchor', 'middle');
+    svg.appendChild(limitLbl);
+    updateLimitLabel();
+
+    // ── Needle ──
+    const needleG = document.createElementNS(svgNS, 'g');
+    needleG.id = 'gauge-needle';
+
+    const shaft = document.createElementNS(svgNS, 'line');
+    shaft.setAttribute('x1', '0'); shaft.setAttribute('y1', '10');
+    shaft.setAttribute('x2', '0'); shaft.setAttribute('y2', String(-(r - 20)));
+    shaft.setAttribute('stroke', '#ff3b30');
+    shaft.setAttribute('stroke-width', '2.5');
+    shaft.setAttribute('stroke-linecap', 'round');
+
+    const hub = document.createElementNS(svgNS, 'circle');
+    hub.setAttribute('cx', '0'); hub.setAttribute('cy', '0');
+    hub.setAttribute('r', '7');
+    hub.setAttribute('fill', '#ff3b30');
+    hub.setAttribute('filter', 'url(#glow)');
+
+    needleG.appendChild(shaft);
+    needleG.appendChild(hub);
+    svg.appendChild(needleG);
+    gaugeNeedle = needleG;
+}
+
+/**
+ * rebuildGaugeZones()
+ * ────────────────────
+ * Draws (or redraws) the coloured zone arcs on the gauge.
+ * Called once during buildGaugeSVG() and again whenever the
+ * speed limit changes (OSM returns a new value).
+ *
+ * Zone boundaries:
+ *   Green:  0          → currentSpeedLimit
+ *   Amber:  limit      → limit × 1.3  (30% over)
+ *   Red:    limit×1.3  → GAUGE_MAX
+ */
+function rebuildGaugeZones() {
+    const svg    = document.getElementById('gauge-svg');
+    const svgNS  = 'http://www.w3.org/2000/svg';
+    const cx     = 160, cy = 160, r = 120;
+    const startDeg = 135, sweepDeg = 270;
+
+    function toRad(deg) { return (deg - 90) * Math.PI / 180; }
+    function pt(deg, radius) {
+        const rad = toRad(deg);
+        return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+    }
+    function mkArc(radius, a1, a2, stroke, width, opacity = 1) {
+        const large = (a2 - a1) > 180 ? 1 : 0;
+        const s = pt(a1, radius), e = pt(a2, radius);
+        const el = document.createElementNS(svgNS, 'path');
+        el.setAttribute('d', `M${s.x} ${s.y} A${radius} ${radius} 0 ${large} 1 ${e.x} ${e.y}`);
+        el.setAttribute('fill', 'none');
+        el.setAttribute('stroke', stroke);
+        el.setAttribute('stroke-width', String(width));
+        el.setAttribute('stroke-linecap', 'round');
+        el.setAttribute('opacity', String(opacity));
+        return el;
+    }
+
+    const degAt = spd => startDeg + (Math.min(spd, GAUGE_MAX) / GAUGE_MAX) * sweepDeg;
+    const warnLimit   = currentSpeedLimit * 1.3;
+
+    // Remove old zone arcs
+    svg.querySelectorAll('.zone-arc').forEach(el => el.remove());
+
+    const safe  = mkArc(r, startDeg,            degAt(currentSpeedLimit), '#00e5a0', 22, 0.35);
+    const warn  = mkArc(r, degAt(currentSpeedLimit), degAt(warnLimit),    '#ffc820', 22, 0.45);
+    const dang  = mkArc(r, degAt(warnLimit),         degAt(GAUGE_MAX),    '#ff3b30', 22, 0.55);
+    safe.classList.add('zone-arc');
+    warn.classList.add('zone-arc');
+    dang.classList.add('zone-arc');
+
+    // Insert zone arcs after the track arc (first child after defs)
+    const trackArc = svg.querySelector('path:not(.zone-arc)');
+    svg.insertBefore(safe, trackArc ? trackArc.nextSibling : svg.firstChild);
+    svg.insertBefore(warn, safe.nextSibling);
+    svg.insertBefore(dang, warn.nextSibling);
+
+    // Update the speed limit marker position and label
+    if (gaugeSvgBuilt) {
+        updateLimitMarker();
+        updateLimitLabel();
+    }
+}
+
+/**
+ * updateLimitMarker()
+ * ────────────────────
+ * Moves the amber triangle marker to the current speed limit position
+ * on the gauge dial. The triangle points inward toward the arc centre.
+ */
+function updateLimitMarker() {
+    if (!gaugeLimitMarker) return;
+    const cx = 160, cy = 160, r = 120;
+    const startDeg = 135, sweepDeg = 270;
+    const degAt = spd => startDeg + (Math.min(spd, GAUGE_MAX) / GAUGE_MAX) * sweepDeg;
+
+    function toRad(deg) { return (deg - 90) * Math.PI / 180; }
+    function pt(deg, radius) {
+        const rad = toRad(deg);
+        return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+    }
+
+    const angle  = degAt(currentSpeedLimit);
+    const tip    = pt(angle, r + 20);
+    const left   = pt(angle - 5, r + 30);
+    const right  = pt(angle + 5, r + 30);
+
+    gaugeLimitMarker.setAttribute('points',
+        `${tip.x},${tip.y} ${left.x},${left.y} ${right.x},${right.y}`);
+}
+
+/** Update the speed limit text label near the marker */
+function updateLimitLabel() {
+    const lbl = document.getElementById('gauge-limit-lbl');
+    if (!lbl) return;
+    const cx = 160, cy = 160, r = 120;
+    const startDeg = 135, sweepDeg = 270;
+    const degAt = spd => startDeg + (Math.min(spd, GAUGE_MAX) / GAUGE_MAX) * sweepDeg;
+
+    function toRad(deg) { return (deg - 90) * Math.PI / 180; }
+    function pt(deg, radius) {
+        const rad = toRad(deg);
+        return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+    }
+
+    const angle = degAt(currentSpeedLimit);
+    const p     = pt(angle, r + 46);
+    lbl.setAttribute('x', p.x);
+    lbl.setAttribute('y', p.y);
+    lbl.textContent = currentSpeedLimit;
+}
+
+/**
+ * updateGaugeNeedle(speed)
+ * ─────────────────────────
+ * Rotates the needle SVG group and redraws the fill arc.
+ * Called every GPS tick while on the danger screen.
+ *
+ * The needle <g> is centred at (0,0) and translated to (cx,cy).
+ * Rotating the <g> around its local origin (0,0) = rotating around
+ * the gauge centre, which is exactly what we want.
+ *
+ * Angle mapping:
+ *   speed=0       → needle at startDeg (135°) → rotate = 135-90 = 45°
+ *   speed=GAUGE_MAX → needle at 405° → rotate = 315°
+ */
+function updateGaugeNeedle(speed) {
+    if (!gaugeSvgBuilt || !gaugeNeedle) return;
+
+    const cx = 160, cy = 160, r = 120;
+    const startDeg = 135, sweepDeg = 270;
+    const clampSpd = Math.min(speed, GAUGE_MAX);
+    const angle    = startDeg + (clampSpd / GAUGE_MAX) * sweepDeg;
+
+    // rotate(angle - 90) because needle SVG points "up" (north = 0°)
+    // but SVG 0° is "right" (east), so we subtract 90° offset.
+    gaugeNeedle.setAttribute('transform', `translate(${cx},${cy}) rotate(${angle - 90})`);
+
+    // Redraw fill arc from start to current needle position
+    if (gaugeFillArc) {
+        function toRad(deg) { return (deg - 90) * Math.PI / 180; }
+        function pt(deg, radius) {
+            const rad = toRad(deg);
+            return { x: cx + radius * Math.cos(rad), y: cy + radius * Math.sin(rad) };
+        }
+        const s     = pt(startDeg, r);
+        const e     = pt(angle, r);
+        const large = (angle - startDeg) > 180 ? 1 : 0;
+        gaugeFillArc.setAttribute('d', `M${s.x} ${s.y} A${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`);
+    }
+}
+
+/* ============================================================
+   1-SECOND TICKER
+   ─────────────────────────────────────────────────────────────
+   Runs every second via setInterval.
+   Handles:
+   • Speeding duration clock (MM:SS format)
+   • Nag countdown progress bar
+   • Text nag display trigger (after NAG_SHOW_SECS)
+   • Voice nag trigger (after NAG_VOICE_SECS, then every NAG_VOICE_INTERVAL)
+============================================================ */
+function secondTick() {
+    if (speedingStart === null) return; // not currently speeding
+
+    speedingSeconds = Math.floor((Date.now() - speedingStart) / 1000);
+
+    /*
+        Speeding clock colour escalation:
+          0–59s    → default danger red
+          60–179s  → amber (text nag about to appear)
+          180s+    → bright red (voice nags active)
+    */
+    dom.speedingClock.textContent = fmtMmSs(speedingSeconds);
+    if (speedingSeconds >= NAG_VOICE_SECS) {
+        dom.speedingClock.style.color = '#ff3b30';
+    } else if (speedingSeconds >= NAG_SHOW_SECS) {
+        dom.speedingClock.style.color = '#ffc820';
+    }
+
+    // Nag countdown bar fills from 0% → 100% over NAG_VOICE_SECS seconds
+    const barPct = Math.min((speedingSeconds / NAG_VOICE_SECS) * 100, 100);
+    dom.nagCountFill.style.width = barPct + '%';
+    const remaining = Math.max(0, NAG_VOICE_SECS - speedingSeconds);
+    dom.nagCountLabel.textContent = remaining > 0
+        ? `${fmtMmSs(remaining)} until voice nags`
+        : 'Voice nags active';
+
+    dom.nagTimer.textContent = `Speeding for: ${fmtMmSs(speedingSeconds)}`;
+
+    /*
+        Text nag: show a new message every 20 seconds after NAG_SHOW_SECS
+    */
+    if (speedingSeconds >= NAG_SHOW_SECS) {
+        const now = Date.now();
+        if (now - lastNagShowTime > 20000 || currentNagMsg === '') {
+            currentNagMsg = getNextNag();
+            lastNagShowTime = now;
+            showNagMessage(currentNagMsg);
+        }
+    }
+
+    /*
+        Voice nag: speak a message after NAG_VOICE_SECS, then every
+        NAG_VOICE_INTERVAL seconds. Uses a separate lastNagVoiceTime
+        so it doesn't compete with the physics warning cooldown.
+    */
+    if (speedingSeconds >= NAG_VOICE_SECS) {
+        const now = Date.now();
+        if (now - lastNagVoiceTime > NAG_VOICE_INTERVAL * 1000) {
+            speakNag(currentNagMsg || getNextNag());
+            lastNagVoiceTime = now;
+        }
+    }
+}
+
+/* ============================================================
+   NAG MESSAGE ENGINE
+============================================================ */
+
+/** Get the next safety message from the shuffled pool */
+function getNextNag() {
+    nagIndex = (nagIndex + 1) % nagPool.length;
+    // Re-shuffle when the pool wraps around (prevents repetition patterns)
+    if (nagIndex === 0) nagPool = shuffle(safetyMessages);
+    return nagPool[nagIndex];
+}
+
+/** Show the nag message on both screens */
+function showNagMessage(msg) {
+    dom.nagText.textContent = msg;
+    dom.nagBanner.classList.add('visible');
+    dom.dangerNagText.textContent = msg;
+    dom.dangerNag.classList.remove('nag-hidden');
+    dom.dangerNag.classList.add('nag-visible');
+}
+
+/** Hide all nag UI and reset state */
+function clearNag() {
+    dom.nagBanner.classList.remove('visible');
+    dom.dangerNag.classList.remove('nag-visible');
+    dom.dangerNag.classList.add('nag-hidden');
+    currentNagMsg   = '';
+    lastNagShowTime = 0;
+    lastNagVoiceTime = 0;
+}
+
+/* ============================================================
+   SPEECH SYNTHESIS
+   ─────────────────────────────────────────────────────────────
+   Two separate throttle tracks:
+   • speak()     — for physics/safety warnings (12s cooldown)
+   • speakNag()  — for nag messages (managed by secondTick timer)
+   Both call _speakRaw() which cancels any queued utterances first
+   (prevents stacked/overlapping voices on slow GPS ticks).
+============================================================ */
+
+function speak(text) {
+    // 12-second cooldown prevents rapid overlapping physics warnings
+    if (Date.now() - lastSpeechTime < 12000) return;
+    _speakRaw(text);
+    lastSpeechTime = Date.now();
+}
+
+function speakNag(text) {
+    // Nag timing is managed externally by secondTick()
+    _speakRaw(text);
+}
+
+function _speakRaw(text) {
+    if (!window.speechSynthesis) return;
+    const utt = new SpeechSynthesisUtterance(text);
+    utt.rate  = 0.9;  // slightly slower than normal for clarity while driving
+    utt.pitch = 1;
+    window.speechSynthesis.cancel(); // clear any queued speech
+    window.speechSynthesis.speak(utt);
+}
+
+/* ============================================================
+   EVENT LOG
+   ─────────────────────────────────────────────────────────────
+   Timestamped log of driving events (speeding, hard maneuvers,
+   limit changes). Capped at 50 entries to manage memory.
+   New entries are prepended (most recent at top).
+============================================================ */
+function logEvent(type, detail) {
+    // Remove the placeholder "no events" item on first real entry
+    if (!hasLogEntries && dom.logEmpty) {
+        dom.logEmpty.remove();
+        hasLogEntries = true;
+    }
+    const li   = document.createElement('li');
+    const time = new Date().toLocaleTimeString('en-CA', { hour12: false });
+    li.innerHTML = `
+        <span class="log-time">${time}</span>
+        <span class="log-flag">⬥</span>
+        <span>${type} — ${detail}</span>`;
+    dom.log.insertBefore(li, dom.log.firstChild);
+    // Trim log if it exceeds 50 items
+    while (dom.log.children.length > 50) dom.log.removeChild(dom.log.lastChild);
+}
+
+/* ============================================================
+   GLOBAL EFFECTS
+============================================================ */
+
+/** Brief radial red flash to signal entering the danger zone */
+function flashDanger() {
+    dom.flash.classList.add('on');
+    setTimeout(() => dom.flash.classList.remove('on'), 300);
+}
+
+/**
+ * "I'll Slow Down" button handler.
+ * Dismisses the gauge screen manually and returns to the dashboard.
+ * The GPS update loop will slide back to danger if speed stays high.
+ */
+function onSlowDownPressed() {
+    speak("Good choice. Reducing speed. The road thanks you.");
+    inDangerScreen = false;
+    goToScreen(0);
+    dom.message.textContent = '✅ Good call! The road thanks you. Keep slowing down.';
+}
+</script>
+</body>
+</html>
